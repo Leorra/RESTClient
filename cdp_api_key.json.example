@@ -1,0 +1,4 @@
+{
+  "name": "organizations/your-org-id/api-keys/your-key-id",
+  "privateKey": "-----BEGIN EC PRIVATE KEY-----\nYourPrivateKeyHere\n-----END EC PRIVATE KEY-----"
+}
