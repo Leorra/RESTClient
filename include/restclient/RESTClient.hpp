@@ -21,6 +21,8 @@
 #include <functional>
 #include <queue>
 #include <condition_variable>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -469,23 +471,25 @@ namespace restclient {
 				.set_audience("cdp_service")
 				.set_payload_claim("uri", jwt::claim(uri))
 				.set_header_claim("kid", jwt::claim(key_name_))
-				.set_header_claim("nonce", jwt::claim(generate_nonce(16)))
+				.set_header_claim("nonce", jwt::claim(generate_nonce()))
 				.sign(jwt::algorithm::es256(key_name_, key_secret_));
 		}
 
-		std::string generate_nonce(size_t len) const noexcept {
-			static constexpr char hex[] = "0123456789abcdef";
-			static thread_local std::mt19937 gen([]() {
-				std::random_device rd;
-				return std::mt19937(rd());
-			}());
-			std::uniform_int_distribution<> dis(0, 15);
-			std::string s;
-			s.reserve(len);
-			for (size_t i = 0; i < len; ++i) {
-				s += hex[dis(gen)];
+		std::string generate_nonce() const {
+			unsigned char nonce_raw[16];
+			if (RAND_bytes(nonce_raw, sizeof(nonce_raw)) != 1) {
+				throw std::runtime_error("RAND_bytes failed");
 			}
-			return s;
+
+			std::string encoded;
+			encoded.resize(EVP_ENCODE_LENGTH(sizeof(nonce_raw)));
+			int actual_len = EVP_EncodeBlock(
+				reinterpret_cast<unsigned char*>(&encoded[0]),
+				nonce_raw,
+				sizeof(nonce_raw)
+			);
+			encoded.resize(actual_len);
+			return encoded;
 		}
 
 		static size_t write_cb(void* contents, size_t size, size_t nmemb, void* userp) noexcept {
