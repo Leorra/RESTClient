@@ -1,126 +1,198 @@
 ﻿#pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 
-#include <jwt-cpp/jwt.h>
-#include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#include <jwt-cpp/jwt.h>
+#pragma warning(pop)
+#else
+#include <jwt-cpp/jwt.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
-using json = nlohmann::json;
+namespace jwt_util {
 
-class JWTGenerator {
-public:
-	// Constructor with file path
-	explicit JWTGenerator(const std::string& cdp_filename)
-		: key_public(""), key_private("") {
-		load_credentials(cdp_filename);
-	}
+    // =========================================================
+    //  JWTGenerator
+    //
+    //  Generates ES256 JWTs for the Coinbase CDP REST API.
+    //
+    //  Two construction modes:
+    //    1. File path  -- reads "name" and "privateKey" from a
+    //                     Coinbase CDP JSON credentials file.
+    //    2. Direct     -- accepts the key name and PEM private
+    //                     key string directly (useful for tests).
+    //
+    //  create_jwt() is thread-safe (const, no mutable state).
+    // =========================================================
+    class JWTGenerator {
+    public:
+        // ---------------------------------------------------------
+        //  Construction
+        // ---------------------------------------------------------
 
-	// Constructor with direct credentials (for testing or programmatic use)
-	JWTGenerator(std::string public_key, std::string private_key)
-		: key_public(std::move(public_key)),
-		key_private(std::move(private_key)) {
-		if (key_public.empty() || key_private.empty()) {
-			throw std::runtime_error("Public and private keys cannot be empty");
-		}
-	}
+        /// Load credentials from a Coinbase CDP JSON file.
+        explicit JWTGenerator(const std::string& cdp_filename) {
+            load_credentials(cdp_filename);
+        }
 
-	// Rule of Five - proper resource management
-	JWTGenerator(const JWTGenerator&) = default;
-	JWTGenerator& operator=(const JWTGenerator&) = default;
-	JWTGenerator(JWTGenerator&&) noexcept = default;
-	JWTGenerator& operator=(JWTGenerator&&) noexcept = default;
-	~JWTGenerator() = default;
+        /// Construct directly from a key name and PEM private key.
+        /// Useful for unit tests or programmatic credential injection.
+        JWTGenerator(std::string key_name, std::string private_key)
+            : key_name_(std::move(key_name))
+            , key_private_(std::move(private_key))
+        {
+            if (key_name_.empty()) {
+                throw std::invalid_argument("Key name cannot be empty");
+            }
+            if (key_private_.empty()) {
+                throw std::invalid_argument("Private key cannot be empty");
+            }
+        }
 
-	std::string create_jwt(const std::string& uri = "") const {
+        // Rule of Five -- all defaulted; no owning raw resources.
+        JWTGenerator(const JWTGenerator&) = default;
+        JWTGenerator& operator=(const JWTGenerator&) = default;
+        JWTGenerator(JWTGenerator&&) noexcept = default;
+        JWTGenerator& operator=(JWTGenerator&&) noexcept = default;
+        ~JWTGenerator() = default;
 
-		std::string nonce = generate_nonce();
-		auto now = std::chrono::system_clock::now();
+        // ---------------------------------------------------------
+        //  JWT creation
+        //
+        //  uri  -- optional URI claim ("<METHOD> <HOST><PATH>").
+        //          Pass an empty string to omit.
+        //
+        //  The token is back-dated by kSkewBuffer seconds on both
+        //  iat and nbf to tolerate minor server clock skew, while
+        //  the expiry is kept at a full 120 s from `now`.
+        // ---------------------------------------------------------
+        [[nodiscard]] std::string create_jwt(const std::string& uri = "") const {
+            const std::string nonce = generate_nonce();
 
-		try {
-			// Avoid accidental copy from a chained temporary by creating the builder
-			// first and then calling mutating methods on it.
-			auto token = ::jwt::create();
-			if (!uri.empty())
-				token.set_payload_claim("uri", ::jwt::claim(uri));
-			token.set_subject(key_public);
-			token.set_issuer("cdp");
-			token.set_not_before(now - std::chrono::seconds { skew_buffer });
-			token.set_expires_at(now + std::chrono::seconds { 120 - skew_buffer });
-			token.set_header_claim("kid", ::jwt::claim(key_public));
-			token.set_header_claim("nonce", ::jwt::claim(nonce));
+            // Back-date by kSkewBuffer to tolerate server clock skew.
+            const auto now = std::chrono::system_clock::now();
+            const auto backdated = now - std::chrono::seconds { kSkewBuffer };
 
-			return token.sign(::jwt::algorithm::es256(key_public, key_private));
+            try {
+                auto token = ::jwt::create();
 
-		} catch (const std::exception& e) {
-			throw std::runtime_error(std::string("JWT signing failed: ") + e.what());
-		}
-	}
+                token.set_type("JWT");
+                token.set_issuer("cdp");
+                token.set_subject(key_name_);
+                token.set_issued_at(backdated);
+                token.set_not_before(backdated);
+                token.set_expires_at(now + std::chrono::seconds { 120 });
+                token.set_audience("cdp_service");
 
-private:
-	static constexpr int DEFAULT_NONCE_SIZE = 16;
-	static constexpr int skew_buffer = 1;
+                if (!uri.empty()) {
+                    token.set_payload_claim("uri", ::jwt::claim(uri));
+                }
 
-	std::string key_public;
-	std::string key_private;
+                token.set_header_claim("kid", ::jwt::claim(key_name_));
+                token.set_header_claim("nonce", ::jwt::claim(nonce));
 
-	// Load credentials from JSON file
-	void load_credentials(const std::string& filename) {
-		json jsonData;
-		std::ifstream file(filename);
+                return token.sign(::jwt::algorithm::es256(key_name_, key_private_));
 
-		if (!file.is_open()) {
-			throw std::runtime_error("Failed to open CDP file: " + filename);
-		}
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("JWT signing failed: ") + e.what());
+            }
+        }
 
-		try {
-			file >> jsonData;
+    private:
+        // Number of seconds to back-date iat/nbf to tolerate clock skew.
+        static constexpr int kSkewBuffer = 1;
 
-			// Check for required fields
-			if (!jsonData.contains("name")) {
-				throw std::runtime_error("Missing required field: 'name'");
-			}
-			if (!jsonData.contains("privateKey")) {
-				throw std::runtime_error("Missing required field: 'privateKey'");
-			}
+        // Base64 output length for kNonceBytes raw bytes: ceil(n/3)*4.
+        // Deliberately avoiding EVP_ENCODE_LENGTH which adds a newline slot.
+        static constexpr std::size_t kNonceBytes = 16;
+        static constexpr std::size_t kNonceB64Len = ((kNonceBytes + 2) / 3) * 4;
 
-			key_public = jsonData.at("name").get<std::string>();
-			key_private = jsonData.at("privateKey").get<std::string>();
+        std::string key_name_;     // CDP API key name (used as sub and kid)
+        std::string key_private_;  // PEM-encoded EC private key
 
-			if (key_public.empty()) throw std::runtime_error("Public key cannot be empty");
-			if (key_private.empty()) throw std::runtime_error("Private key cannot be empty");
+        // ---------------------------------------------------------
+        //  Credential loading
+        // ---------------------------------------------------------
+        void load_credentials(const std::string& filename) {
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                throw std::runtime_error("Failed to open CDP credentials file: " + filename);
+            }
 
-		} catch (const json::exception& e) {
-			throw std::runtime_error(std::string("JSON parsing failed: ") + e.what());
-		}
-	}
+            try {
+                const nlohmann::json j = nlohmann::json::parse(file);
 
-	// Generate cryptographically secure random nonce
-	std::string generate_nonce() const {
-		unsigned char nonce_raw[DEFAULT_NONCE_SIZE];
+                key_name_ = j.at("name").get<std::string>();
+                key_private_ = j.at("privateKey").get<std::string>();
 
-		if (RAND_bytes(nonce_raw, static_cast<int>(sizeof(nonce_raw))) != 1) {
-			throw std::runtime_error("Failed to generate random nonce: RAND_bytes failed");
-		}
+                if (key_name_.empty()) {
+                    throw std::runtime_error("Field 'name' is empty in credentials file");
+                }
+                if (key_private_.empty()) {
+                    throw std::runtime_error("Field 'privateKey' is empty in credentials file");
+                }
 
-		// Base64 encoding
-		std::string encoded;
-		encoded.resize(EVP_ENCODE_LENGTH(static_cast<int>(sizeof(nonce_raw))));
-		int actual_len = EVP_EncodeBlock(
-			reinterpret_cast<unsigned char*>(&encoded[0]),
-			nonce_raw,
-			static_cast<int>(sizeof(nonce_raw))
-		);
-		if (actual_len < 0) {
-			throw std::runtime_error("EVP_EncodeBlock failed");
-		}
-		encoded.resize(static_cast<size_t>(actual_len));
+                // Unescape literal "\\n" sequences that some CDP SDK tooling
+                // writes into the JSON value instead of real newlines.
+                // nlohmann correctly handles JSON "\n" -> '\n'; this pass
+                // handles the case where the raw string contains backslash-n.
+                unescape_newlines(key_private_);
 
-		return encoded;
-	}
-};
+            } catch (const nlohmann::json::exception& e) {
+                throw std::runtime_error(std::string("Credentials JSON parse error: ") + e.what());
+            }
+        }
+
+        // Replace all literal two-character sequences "\n" (0x5C 0x6E)
+        // with a real newline (0x0A) in `s`.
+        static void unescape_newlines(std::string& s) {
+            std::string out;
+            out.reserve(s.size());
+            for (std::size_t i = 0; i < s.size(); ++i) {
+                if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == 'n') {
+                    out += '\n';
+                    ++i;
+                } else {
+                    out += s[i];
+                }
+            }
+            s = std::move(out);
+        }
+
+        // ---------------------------------------------------------
+        //  Nonce generation
+        // ---------------------------------------------------------
+        [[nodiscard]] std::string generate_nonce() const {
+            unsigned char raw[kNonceBytes];
+            if (RAND_bytes(raw, static_cast<int>(kNonceBytes)) != 1) {
+                throw std::runtime_error("RAND_bytes failed -- cannot generate nonce");
+            }
+
+            // Exact base64 length: no newline, no over-allocation.
+            std::string encoded(kNonceB64Len, '\0');
+            const int actual = EVP_EncodeBlock(
+                reinterpret_cast<unsigned char*>(encoded.data()),
+                raw,
+                static_cast<int>(kNonceBytes));
+
+            if (actual < 0) {
+                throw std::runtime_error("EVP_EncodeBlock failed");
+            }
+
+            encoded.resize(static_cast<std::size_t>(actual));
+            return encoded;
+        }
+    };
+
+} // namespace jwt_util
