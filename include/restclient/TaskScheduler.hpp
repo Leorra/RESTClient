@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <atomic>
 #include <chrono>
@@ -32,6 +32,18 @@ namespace task_scheduler {
     //  ---------
     //  Slots survive stop()/start() cycles; only the destructor
     //  (or explicit removal, if added later) discards them.
+    //
+    //  start() rearms every slot's next_tick to "now + interval",
+    //  so a slot added while stopped always fires one full
+    //  interval after the scheduler is (re)started, rather than
+    //  potentially firing immediately due to a stale timestamp.
+    //
+    //  If the worker is unable to run for an extended period
+    //  (e.g. process suspension) and one or more intervals are
+    //  missed, each slot fires at most once per loop iteration
+    //  and its next_tick is advanced by a single interval from
+    //  "now" (catch-up is capped to one tick; missed ticks are
+    //  skipped rather than fired in a tight loop).
     // =========================================================
     class TaskScheduler {
     public:
@@ -55,7 +67,8 @@ namespace task_scheduler {
         // ---------------------------------------------------------
         //  Register a periodic callback.
         //  May be called before or after start().
-        //  The first firing occurs one full interval after registration.
+        //  The first firing occurs one full interval after registration
+        //  (or after the next start(), if the scheduler is not running).
         // ---------------------------------------------------------
         template<typename Rep, typename Period>
         void add(std::chrono::duration<Rep, Period> interval, Callback cb) {
@@ -85,9 +98,19 @@ namespace task_scheduler {
 
         // ---------------------------------------------------------
         //  Start the worker thread.  No-op if already running.
+        //  Rearms every slot's next_tick to "now + interval" so that
+        //  slots registered while stopped fire a full interval after
+        //  this call, rather than immediately due to a stale timestamp.
         // ---------------------------------------------------------
         void start() {
             if (running_.exchange(true)) { return; }
+            {
+                std::lock_guard<std::mutex> lock(slots_mtx_);
+                const auto now = Clock::now();
+                for (auto& s : slots_) {
+                    s.next_tick = now + s.interval;
+                }
+            }
             thread_ = std::thread(&TaskScheduler::loop, this);
         }
 
@@ -164,13 +187,15 @@ namespace task_scheduler {
                     for (auto& s : slots_) {
                         if (now >= s.next_tick) {
                             due.push_back(s.callback);
-                            // Advance by exactly one interval to prevent drift.
-                            // If multiple intervals have elapsed (e.g. the process
-                            // was suspended), advance by as many as needed so that
-                            // next_tick is always strictly in the future.
-                            do {
-                                s.next_tick += s.interval;
-                            } while (s.next_tick <= now);
+                            // Advance by exactly one interval. If multiple
+                            // intervals have elapsed (e.g. the process was
+                            // suspended), do NOT replay every missed tick:
+                            // skip them and resume cadence relative to "now"
+                            // so the loop cannot stall under the lock.
+                            s.next_tick += s.interval;
+                            if (s.next_tick <= now) {
+                                s.next_tick = now + s.interval;
+                            }
                         }
                     }
                 }   // release slots_mtx_ before invoking callbacks
